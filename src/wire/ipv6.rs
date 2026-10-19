@@ -76,6 +76,7 @@ impl From<u8> for MulticastScope {
 
 pub use core::net::Ipv6Addr as Address;
 
+/// IPv6 address operations used by the network stack.
 pub trait AddressExt {
     /// Construct an IPv6 address from a sequence of octets, in big-endian.
     ///
@@ -661,7 +662,7 @@ impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
 }
 
 #[cfg(test)]
-pub mod test {
+pub(crate) mod test {
     use super::*;
     use crate::wire::pretty_print::PrettyPrinter;
 

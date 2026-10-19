@@ -1071,7 +1071,7 @@ mod test {
             src_port: REMOTE_PORT,
             dst_port: LOCAL_PORT,
         };
-        socket.process(cx, PacketMeta::default(), &REMOTE_IP_REPR, &repr, &[]);
+        socket.process(cx, PacketMeta::default(), &REMOTE_IP_REPR, &repr, &[][..]);
         assert_eq!(socket.recv(), Ok((&[][..], remote_metadata_with_local())));
     }
 

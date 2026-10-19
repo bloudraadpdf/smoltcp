@@ -3,6 +3,7 @@
 // Consult RFC 7414 when implementing a new feature.
 
 use core::fmt::Display;
+use core::num::NonZeroU8;
 #[cfg(feature = "async")]
 use core::task::Waker;
 use core::{fmt, mem};
@@ -13,8 +14,8 @@ use crate::socket::{Context, PollAt};
 use crate::storage::{Assembler, RingBuffer};
 use crate::time::{Duration, Instant};
 use crate::wire::{
-    IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TcpControl, TcpRepr, TcpSeqNumber,
-    TcpTimestampGenerator, TcpTimestampRepr, TCP_HEADER_LEN,
+    IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TcpControl, TcpFastOpenCookie,
+    TcpRepr, TcpSeqNumber, TcpTimestampGenerator, TcpTimestampRepr, TCP_HEADER_LEN,
 };
 
 mod congestion;
@@ -121,6 +122,80 @@ pub enum State {
     Closing,
     LastAck,
     TimeWait,
+}
+
+/// Whether the caller authenticated the SYN cookie and reserved an early-open slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastOpenAdmission {
+    Deny,
+    Accept,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FastOpenState {
+    Disabled,
+    TimedOut,
+    Prepared {
+        cookie: TcpFastOpenCookie,
+        admission: FastOpenAdmission,
+    },
+    Accepted {
+        cookie: TcpFastOpenCookie,
+        syn_sequence: TcpSeqNumber,
+    },
+    Closing {
+        cookie: TcpFastOpenCookie,
+        syn_sequence: TcpSeqNumber,
+    },
+}
+
+impl FastOpenState {
+    fn cookie(self) -> Option<TcpFastOpenCookie> {
+        match self {
+            Self::Disabled | Self::TimedOut => None,
+            Self::Prepared { cookie, .. }
+            | Self::Accepted { cookie, .. }
+            | Self::Closing { cookie, .. } => Some(cookie),
+        }
+    }
+
+    fn syn_sequence(self) -> Option<TcpSeqNumber> {
+        match self {
+            Self::Accepted { syn_sequence, .. } | Self::Closing { syn_sequence, .. } => {
+                Some(syn_sequence)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FastOpenRetry {
+    limit: NonZeroU8,
+    attempts: u8,
+    resend_syn: bool,
+    suppress_data: bool,
+}
+
+const DEFAULT_FAST_OPEN_RETRIES: u8 = 6;
+const FAST_OPEN_INITIAL_RTO_MILLIS: u64 = 1_000;
+const FAST_OPEN_MAX_RTO_MILLIS: u64 = 120_000;
+
+impl FastOpenRetry {
+    fn reset(&mut self) {
+        self.attempts = 0;
+        self.resend_syn = false;
+        self.suppress_data = false;
+    }
+
+    fn delay(&self) -> Duration {
+        let backoff = 1_u64.checked_shl(self.attempts.into()).unwrap_or(u64::MAX);
+        Duration::from_millis(
+            backoff
+                .saturating_mul(FAST_OPEN_INITIAL_RTO_MILLIS)
+                .min(FAST_OPEN_MAX_RTO_MILLIS),
+        )
+    }
 }
 
 impl fmt::Display for State {
@@ -478,6 +553,8 @@ pub struct Socket<'a> {
 
     /// Nagle's Algorithm enabled.
     nagle: bool,
+    fast_open: FastOpenState,
+    fast_open_retry: FastOpenRetry,
 
     /// The congestion control algorithm.
     congestion_controller: congestion::AnyController,
@@ -547,6 +624,13 @@ impl<'a> Socket<'a> {
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
             nagle: true,
+            fast_open: FastOpenState::Disabled,
+            fast_open_retry: FastOpenRetry {
+                limit: NonZeroU8::new(DEFAULT_FAST_OPEN_RETRIES).unwrap(),
+                attempts: 0,
+                resend_syn: false,
+                suppress_data: false,
+            },
             tsval_generator: None,
             last_remote_tsval: 0,
             congestion_controller: congestion::AnyController::new(),
@@ -817,11 +901,62 @@ impl<'a> Socket<'a> {
         self.state
     }
 
+    /// Prepares a passive SYN response after caller-side cookie and queue checks.
+    ///
+    /// `Accept` requires an authenticated incoming cookie and a reserved pending-open slot.
+    pub fn prepare_fast_open(
+        &mut self,
+        cookie: TcpFastOpenCookie,
+        admission: FastOpenAdmission,
+    ) -> Result<(), ListenError> {
+        if self.state != State::Listen || cookie.as_bytes().is_empty() {
+            return Err(ListenError::InvalidState);
+        }
+        self.fast_open = FastOpenState::Prepared { cookie, admission };
+        self.fast_open_retry.reset();
+        Ok(())
+    }
+
+    /// Disables Fast Open on the next passive SYN.
+    pub fn disable_fast_open(&mut self) -> Result<(), ListenError> {
+        if self.state != State::Listen {
+            return Err(ListenError::InvalidState);
+        }
+        self.fast_open = FastOpenState::Disabled;
+        Ok(())
+    }
+
+    /// Returns whether an authenticated passive open is awaiting the final ACK.
+    pub fn fast_open_pending(&self) -> bool {
+        self.state == State::SynReceived && self.fast_open.syn_sequence().is_some()
+    }
+
+    /// Sets the retry budget for authenticated passive SYN acknowledgements.
+    pub fn set_fast_open_retries(&mut self, limit: NonZeroU8) {
+        self.fast_open_retry.limit = limit;
+    }
+
+    /// Returns the configured passive Fast Open retry budget.
+    pub fn fast_open_retries(&self) -> NonZeroU8 {
+        self.fast_open_retry.limit
+    }
+
+    /// Takes an exhausted passive Fast Open handshake error.
+    pub fn take_fast_open_timeout(&mut self) -> bool {
+        let timed_out = matches!(self.fast_open, FastOpenState::TimedOut);
+        if timed_out {
+            self.fast_open = FastOpenState::Disabled;
+        }
+        timed_out
+    }
+
     fn reset(&mut self) {
         let rx_cap_log2 =
             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
 
         self.state = State::Closed;
+        self.fast_open = FastOpenState::Disabled;
+        self.fast_open_retry.reset();
         self.timer = Timer::new();
         self.rtte = RttEstimator::default();
         self.assembler = Assembler::new();
@@ -998,6 +1133,22 @@ impl<'a> Socket<'a> {
     /// connection; only the remote end can close it. If you no longer wish to receive any
     /// data and would like to reuse the socket right away, use [abort](#method.abort).
     pub fn close(&mut self) {
+        if self.state == State::SynReceived {
+            if let FastOpenState::Accepted {
+                cookie,
+                syn_sequence,
+            } = self.fast_open
+            {
+                self.fast_open = FastOpenState::Closing {
+                    cookie,
+                    syn_sequence,
+                };
+                return;
+            }
+            if matches!(self.fast_open, FastOpenState::Closing { .. }) {
+                return;
+            }
+        }
         match self.state {
             // In the LISTEN state there is no established connection.
             State::Listen => self.set_state(State::Closed),
@@ -1093,6 +1244,7 @@ impl<'a> Socket<'a> {
     #[inline]
     pub fn may_send(&self) -> bool {
         match self.state {
+            State::SynReceived if matches!(self.fast_open, FastOpenState::Accepted { .. }) => true,
             State::Established => true,
             // In CLOSE-WAIT, the remote endpoint has closed our receive half of the connection
             // but we still can transmit indefinitely.
@@ -1112,6 +1264,7 @@ impl<'a> Socket<'a> {
     #[inline]
     pub fn may_recv(&self) -> bool {
         match self.state {
+            State::SynReceived if self.fast_open_pending() => true,
             State::Established => true,
             // In FIN-WAIT-1/2, we have closed our transmit half of the connection but
             // we still can receive indefinitely.
@@ -1331,6 +1484,7 @@ impl<'a> Socket<'a> {
 
     pub fn reply(ip_repr: &IpRepr, repr: &TcpRepr) -> (IpRepr, TcpRepr<'static>) {
         let reply_repr = TcpRepr {
+            fast_open: None,
             src_port: repr.dst_port,
             dst_port: repr.src_port,
             control: TcpControl::None,
@@ -1482,6 +1636,23 @@ impl<'a> Socket<'a> {
         repr_payload: P,
     ) -> Option<(IpRepr, TcpRepr<'static>)> {
         debug_assert!(self.accepts(cx, ip_repr, repr));
+        let was_fast_open = self.fast_open_pending();
+
+        if self.fast_open_pending()
+            && repr.control == TcpControl::Syn
+            && repr.ack_number.is_none()
+            && self.fast_open.syn_sequence() == Some(repr.seq_number)
+        {
+            let (mut ip_reply, mut reply) = self.ack_reply(ip_repr, repr);
+            reply.control = TcpControl::Syn;
+            reply.seq_number = self.local_seq_no;
+            self.fill_syn_options(
+                &mut reply,
+                cx.ip_mtu() - ip_reply.header_len() - TCP_HEADER_LEN,
+            );
+            ip_reply.set_payload_len(reply.buffer_len());
+            return Some((ip_reply, reply));
+        }
 
         // Consider how much the sequence number space differs from the transmit buffer space.
         let (sent_syn, sent_fin) = match self.state {
@@ -1556,7 +1727,12 @@ impl<'a> Socket<'a> {
             }
             // ACK in the SYN-RECEIVED state must have the exact ACK number, or we RST it.
             (State::SynReceived, _, Some(ack_number)) => {
-                if ack_number != self.local_seq_no + 1 {
+                let acceptable = if self.fast_open_pending() {
+                    ack_number > self.local_seq_no && ack_number <= self.remote_last_seq
+                } else {
+                    ack_number == self.local_seq_no + 1
+                };
+                if !acceptable {
                     net_debug!("unacceptable ACK in response to SYN|ACK");
                     return Some(Self::rst_reply(ip_repr, repr));
                 }
@@ -1603,6 +1779,23 @@ impl<'a> Socket<'a> {
 
         let (payload, payload_offset) = match self.state {
             // In LISTEN and SYN-SENT states, we have not yet synchronized with the remote end.
+            State::Listen
+                if matches!(
+                    self.fast_open,
+                    FastOpenState::Prepared {
+                        admission: FastOpenAdmission::Accept,
+                        ..
+                    }
+                ) && repr.control == TcpControl::Syn
+                    && repr
+                        .fast_open
+                        .is_some_and(|cookie| !cookie.as_bytes().is_empty()) =>
+            {
+                (
+                    repr_payload.index(0..repr_payload.len().min(self.rx_buffer.capacity())),
+                    0,
+                )
+            }
             State::Listen | State::SynSent => (repr_payload.index(0..0), 0),
             _ => {
                 // https://www.rfc-editor.org/rfc/rfc9293.html#name-segment-acceptability-tests
@@ -1668,7 +1861,8 @@ impl<'a> Socket<'a> {
                     self.local_rx_last_seq = Some(repr.seq_number);
 
                     (
-                        repr_payload.index(overlap_start - segment_start..overlap_end - segment_start),
+                        repr_payload
+                            .index(overlap_start - segment_start..overlap_end - segment_start),
                         overlap_start - window_start,
                     )
                 } else {
@@ -1736,7 +1930,9 @@ impl<'a> Socket<'a> {
             // Here we need to additionally check `listen_endpoint`, because we want to make sure
             // that SYN-RECEIVED was actually converted from the LISTEN state (another possible
             // reason is TCP simultaneous open).
-            (State::SynReceived, TcpControl::Rst) if self.listen_endpoint.port != 0 => {
+            (State::SynReceived, TcpControl::Rst)
+                if self.listen_endpoint.port != 0 && !self.fast_open_pending() =>
+            {
                 tcp_trace!("received RST");
                 self.tuple = None;
                 self.set_state(State::Listen);
@@ -1783,12 +1979,30 @@ impl<'a> Socket<'a> {
                     self.tsval_generator = None;
                 }
                 self.set_state(State::SynReceived);
+                if !payload.is_empty() {
+                    if let FastOpenState::Prepared {
+                        cookie,
+                        admission: FastOpenAdmission::Accept,
+                    } = self.fast_open
+                    {
+                        self.fast_open = FastOpenState::Accepted {
+                            cookie,
+                            syn_sequence: repr.seq_number,
+                        };
+                    }
+                }
                 self.timer.set_for_idle(cx.now(), self.keep_alive);
             }
 
             // ACK packets in the SYN-RECEIVED state change it to ESTABLISHED.
             (State::SynReceived, TcpControl::None) => {
-                self.set_state(State::Established);
+                let next = if matches!(self.fast_open, FastOpenState::Closing { .. }) {
+                    State::FinWait1
+                } else {
+                    State::Established
+                };
+                self.fast_open = FastOpenState::Disabled;
+                self.set_state(next);
                 self.timer.set_for_idle(cx.now(), self.keep_alive);
             }
 
@@ -1798,7 +2012,13 @@ impl<'a> Socket<'a> {
             (State::SynReceived, TcpControl::Fin) => {
                 self.remote_seq_no += 1;
                 self.rx_fin_received = true;
-                self.set_state(State::CloseWait);
+                let next = if matches!(self.fast_open, FastOpenState::Closing { .. }) {
+                    State::LastAck
+                } else {
+                    State::CloseWait
+                };
+                self.fast_open = FastOpenState::Disabled;
+                self.set_state(next);
                 self.timer.set_for_idle(cx.now(), self.keep_alive);
             }
 
@@ -2025,6 +2245,14 @@ impl<'a> Socket<'a> {
             }
         }
 
+        if was_fast_open && !self.fast_open_pending() {
+            self.fast_open_retry.reset();
+            if self.remote_last_seq > self.local_seq_no && self.state != State::Closed {
+                self.timer
+                    .set_for_retransmit(cx.now(), self.rtte.retransmission_timeout());
+            }
+        }
+
         // update last remote tsval
         if let Some(timestamp) = repr.timestamp {
             self.last_remote_tsval = timestamp.tsval;
@@ -2137,17 +2365,29 @@ impl<'a> Socket<'a> {
         // The effective max segment size, taking into account our and remote's limits.
         let effective_mss = local_mss.min(self.remote_mss);
 
-        // Have we sent data that hasn't been ACKed yet?
-        let data_in_flight = self.remote_last_seq != self.local_seq_no;
-
-        // If we want to send a SYN and we haven't done so, do it!
-        if matches!(self.state, State::SynSent | State::SynReceived) && !data_in_flight {
+        if self.fast_open_pending() && self.fast_open_retry.resend_syn {
             return true;
         }
 
+        // Have we sent data that hasn't been ACKed yet?
+        let data_start = self.local_seq_no + self.fast_open_pending() as usize;
+        let data_in_flight = self.remote_last_seq > data_start;
+
+        // If we want to send a SYN and we haven't done so, do it!
+        if matches!(self.state, State::SynSent | State::SynReceived)
+            && self.remote_last_seq == self.local_seq_no
+        {
+            return true;
+        }
+        if self.state == State::SynReceived && !self.fast_open_pending() {
+            return false;
+        }
+        if self.fast_open_pending() && self.fast_open_retry.suppress_data {
+            return false;
+        }
+
         // max sequence number we can send.
-        let max_send_seq =
-            self.local_seq_no + core::cmp::min(self.remote_win_len, self.tx_buffer.len());
+        let max_send_seq = data_start + core::cmp::min(self.remote_win_len, self.tx_buffer.len());
 
         // Max amount of octets we can send.
         let max_send = if max_send_seq >= self.remote_last_seq {
@@ -2188,6 +2428,20 @@ impl<'a> Socket<'a> {
         let can_fin = want_fin && self.remote_last_seq == self.local_seq_no + self.tx_buffer.len();
 
         can_send || can_fin
+    }
+
+    fn fill_syn_options(&self, repr: &mut TcpRepr<'_>, local_mss: usize) {
+        repr.max_seg_size = Some(local_mss as u16);
+        repr.window_len = u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX);
+        if self.state == State::SynSent {
+            repr.ack_number = None;
+            repr.window_scale = Some(self.remote_win_shift);
+            repr.sack_permitted = true;
+        } else {
+            repr.sack_permitted = self.remote_has_sack;
+            repr.window_scale = self.remote_win_scale.map(|_| self.remote_win_shift);
+            repr.fast_open = self.fast_open.cookie();
+        }
     }
 
     fn delayed_ack_expired(&self, timestamp: Instant) -> bool {
@@ -2271,12 +2525,31 @@ impl<'a> Socket<'a> {
             .inner_mut()
             .pre_transmit(cx.now());
 
+        // Linux retries only SYN-ACK after a passive Fast Open timeout.
+        // https://codebrowser.dev/linux/linux/net/ipv4/tcp_timer.c.html#tcp_fastopen_synack_timer
+        if self.fast_open_pending() && self.timer.should_retransmit(cx.now()).is_some() {
+            if self.fast_open_retry.attempts >= self.fast_open_retry.limit.get() {
+                self.set_state(State::Closed);
+                self.fast_open = FastOpenState::TimedOut;
+                self.timer = Timer::new();
+            } else {
+                self.fast_open_retry.attempts += 1;
+                self.fast_open_retry.resend_syn = true;
+                self.fast_open_retry.suppress_data = true;
+                self.timer.set_for_idle(cx.now(), self.keep_alive);
+                self.rtte.on_retransmit();
+                self.congestion_controller
+                    .inner_mut()
+                    .on_retransmit(cx.now());
+            }
+        }
+
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(cx.now()) {
             // If a timeout expires, we should abort the connection.
             net_debug!("timeout exceeded");
             self.set_state(State::Closed);
-        } else if !self.seq_to_transmit(cx) {
+        } else if !self.fast_open_pending() && !self.seq_to_transmit(cx) {
             if let Some(retransmit_delta) = self.timer.should_retransmit(cx.now()) {
                 // If a retransmit timer expired, we should resend data starting at the last ACK.
                 net_debug!("retransmitting at t+{}", retransmit_delta);
@@ -2343,6 +2616,7 @@ impl<'a> Socket<'a> {
         // Construct the basic TCP representation, an empty ACK packet.
         // We'll adjust this to be more specific as needed.
         let mut repr = TcpRepr {
+            fast_open: None,
             src_port: tuple.local.port,
             dst_port: tuple.remote.port,
             control: TcpControl::None,
@@ -2372,24 +2646,19 @@ impl<'a> Socket<'a> {
 
             // We transmit a SYN in the SYN-SENT state.
             // We transmit a SYN|ACK in the SYN-RECEIVED state.
-            State::SynSent | State::SynReceived => {
+            State::SynSent | State::SynReceived
+                if !self.fast_open_pending()
+                    || self.remote_last_seq == self.local_seq_no
+                    || self.fast_open_retry.resend_syn =>
+            {
                 repr.control = TcpControl::Syn;
                 repr.seq_number = self.local_seq_no;
-                // window len must NOT be scaled in SYNs.
-                repr.window_len = u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX);
-                if self.state == State::SynSent {
-                    repr.ack_number = None;
-                    repr.window_scale = Some(self.remote_win_shift);
-                    repr.sack_permitted = true;
-                } else {
-                    repr.sack_permitted = self.remote_has_sack;
-                    repr.window_scale = self.remote_win_scale.map(|_| self.remote_win_shift);
-                }
             }
 
             // We transmit data in all states where we may have data in the buffer,
             // or the transmit half of the connection is still open.
-            State::Established
+            State::SynReceived
+            | State::Established
             | State::FinWait1
             | State::Closing
             | State::CloseWait
@@ -2398,7 +2667,8 @@ impl<'a> Socket<'a> {
                 // from the transmit buffer.
 
                 // Right edge of window, ie the max sequence number we're allowed to send.
-                let win_right_edge = self.local_seq_no + self.remote_win_len;
+                let data_start = self.local_seq_no + self.fast_open_pending() as usize;
+                let win_right_edge = data_start + self.remote_win_len;
 
                 // Max amount of octets we're allowed to send according to the remote window.
                 let win_limit = if win_right_edge >= self.remote_last_seq {
@@ -2416,11 +2686,16 @@ impl<'a> Socket<'a> {
                 // 1. remote window
                 // 2. MSS the remote is willing to accept, probably determined by their MTU
                 // 3. MSS we can send, determined by our MTU.
-                let size = win_limit
-                    .min(self.remote_mss)
-                    .min(cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN);
+                let size = if self.fast_open_pending() && self.fast_open_retry.suppress_data {
+                    0
+                } else {
+                    win_limit
+                        .min(self.remote_mss)
+                        .min(self.congestion_controller.inner().window())
+                        .min(cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN)
+                };
 
-                let offset = self.remote_last_seq - self.local_seq_no;
+                let offset = self.remote_last_seq - data_start;
                 repr.payload = self.tx_buffer.get_allocated(offset, size);
 
                 // If we've sent everything we had in the buffer, follow it with the PSH or FIN
@@ -2440,6 +2715,7 @@ impl<'a> Socket<'a> {
 
             // In FIN-WAIT-2 and TIME-WAIT states we may only transmit ACKs for incoming data or FIN
             State::FinWait2 | State::TimeWait => {}
+            State::SynSent => unreachable!(),
         }
 
         // There might be more than one reason to send a packet. E.g. the keep-alive timer
@@ -2481,7 +2757,7 @@ impl<'a> Socket<'a> {
         if repr.control == TcpControl::Syn {
             // Fill the MSS option. See RFC 6691 for an explanation of this calculation.
             let max_segment_size = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
-            repr.max_seg_size = Some(max_segment_size as u16);
+            self.fill_syn_options(&mut repr, max_segment_size);
         }
 
         // Actually send the packet. If this succeeds, it means the packet is in
@@ -2517,7 +2793,15 @@ impl<'a> Socket<'a> {
         }
 
         // We've sent a packet successfully, so we can update the internal state now.
-        self.remote_last_seq = repr.seq_number + repr.segment_len();
+        let sent_end = repr.seq_number + repr.segment_len();
+        self.remote_last_seq = if self.fast_open_pending() {
+            self.remote_last_seq.max(sent_end)
+        } else {
+            sent_end
+        };
+        if self.fast_open_pending() && repr.control == TcpControl::Syn {
+            self.fast_open_retry.resend_syn = false;
+        }
         self.remote_last_ack = repr.ack_number;
         self.remote_last_win = repr.window_len;
 
@@ -2529,7 +2813,12 @@ impl<'a> Socket<'a> {
                 .post_transmit(cx.now(), repr.segment_len());
         }
 
-        if !self.seq_to_transmit(cx) && repr.segment_len() > 0 {
+        if self.fast_open_pending() {
+            if repr.control == TcpControl::Syn {
+                self.timer
+                    .set_for_retransmit(cx.now(), self.fast_open_retry.delay());
+            }
+        } else if !self.seq_to_transmit(cx) && repr.segment_len() > 0 {
             // If we've transmitted all data we could (and there was something at all,
             // data or flag, to transmit, not just an ACK), wind up the retransmit timer.
             self.timer
@@ -2682,6 +2971,7 @@ mod test {
         hop_limit: 64,
     });
     const SEND_TEMPL: TcpRepr<'static> = TcpRepr {
+        fast_open: None,
         src_port: REMOTE_PORT,
         dst_port: LOCAL_PORT,
         control: TcpControl::None,
@@ -2703,6 +2993,7 @@ mod test {
         hop_limit: 64,
     });
     const RECV_TEMPL: TcpRepr<'static> = TcpRepr {
+        fast_open: None,
         src_port: LOCAL_PORT,
         dst_port: REMOTE_PORT,
         control: TcpControl::None,
@@ -2757,7 +3048,10 @@ mod test {
 
         assert!(socket.socket.accepts(&mut socket.cx, &ip_repr, repr));
 
-        match socket.socket.process(&mut socket.cx, &ip_repr, repr) {
+        match socket
+            .socket
+            .process(&mut socket.cx, &ip_repr, repr, repr.payload)
+        {
             Some((_ip_repr, repr)) => {
                 net_trace!("recv: {}", repr);
                 Some(repr)
@@ -8069,5 +8363,200 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
+    }
+    fn fast_open_syn() -> TcpRepr<'static> {
+        TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ,
+            ack_number: None,
+            fast_open: crate::wire::TcpFastOpenCookie::new(&[0x42; 8]),
+            payload: b"request",
+            ..SEND_TEMPL
+        }
+    }
+
+    fn socket_fast_open(tx_capacity: usize, rx_capacity: usize) -> TestSocket {
+        let mut s = socket_with_buffer_sizes(tx_capacity, rx_capacity);
+        s.listen(LOCAL_END).unwrap();
+        let syn = fast_open_syn();
+        s.prepare_fast_open(syn.fast_open.unwrap(), FastOpenAdmission::Accept)
+            .unwrap();
+        send!(s, syn);
+        s
+    }
+
+    fn acknowledge_fast_open(socket: &mut TestSocket, at_millis: i64, ack_number: TcpSeqNumber) {
+        let ack = TcpRepr {
+            seq_number: REMOTE_SEQ + 8,
+            ack_number: Some(ack_number),
+            ..SEND_TEMPL
+        };
+        assert_eq!(send(socket, Instant::from_millis(at_millis), &ack), None);
+    }
+
+    fn expect_fast_open_syn_ack(socket: &mut TestSocket, at_millis: i64) {
+        let sequence = socket.local_seq_no;
+        recv(socket, Instant::from_millis(at_millis), |reply| {
+            let reply = reply.unwrap();
+            assert_eq!(reply.control, TcpControl::Syn);
+            assert_eq!(reply.seq_number, sequence);
+            assert_eq!(reply.ack_number, Some(REMOTE_SEQ + 8));
+            assert_eq!(reply.fast_open, fast_open_syn().fast_open);
+            assert!(reply.payload.is_empty());
+        });
+    }
+
+    fn expect_fast_open_fallback(socket: &mut TestSocket, cookie: Option<TcpFastOpenCookie>) {
+        assert!(!socket.fast_open_pending());
+        assert!(!socket.may_send());
+        assert_eq!(socket.recv_queue(), 0);
+        recv(socket, Instant::from_millis(0), |reply| {
+            let reply = reply.unwrap();
+            assert_eq!(reply.ack_number, Some(REMOTE_SEQ + 1));
+            assert_eq!(reply.fast_open, cookie);
+        });
+    }
+
+    #[test]
+    fn fast_open_syn_data_is_readable_before_final_ack() {
+        let mut s = socket_fast_open(64, 64);
+        assert_eq!(s.state(), State::SynReceived);
+        assert!(s.fast_open_pending());
+        assert_eq!(s.recv_queue(), 7);
+        assert!(s.may_send());
+        let local_seq = s.local_seq_no;
+        expect_fast_open_syn_ack(&mut s, 0);
+        let mut bytes = [0; 7];
+        assert_eq!(s.recv_slice(&mut bytes), Ok(7));
+        assert_eq!(&bytes, b"request");
+        acknowledge_fast_open(&mut s, 0, local_seq + 1);
+        assert_eq!(s.state(), State::Established);
+        assert!(!s.fast_open_pending());
+    }
+
+    #[test]
+    fn fast_open_denied_cookie_discards_syn_data() {
+        let mut s = socket();
+        s.listen(LOCAL_END).unwrap();
+        s.prepare_fast_open(fast_open_syn().fast_open.unwrap(), FastOpenAdmission::Deny)
+            .unwrap();
+        send!(s, fast_open_syn());
+        expect_fast_open_fallback(&mut s, fast_open_syn().fast_open);
+    }
+
+    fn socket_fast_open_with_response() -> TestSocket {
+        let mut s = socket_fast_open(64, 64);
+        let sequence = s.local_seq_no;
+        expect_fast_open_syn_ack(&mut s, 0);
+        assert_eq!(s.send_slice(b"response"), Ok(8));
+        recv(&mut s, Instant::from_millis(0), |reply| {
+            let reply = reply.unwrap();
+            assert_eq!(reply.seq_number, sequence + 1);
+            assert_eq!(reply.ack_number, Some(REMOTE_SEQ + 8));
+            assert_eq!(reply.control, TcpControl::None);
+            assert_eq!(reply.payload, b"response");
+            assert_eq!(reply.fast_open, None);
+        });
+        s
+    }
+
+    #[test]
+    fn fast_open_response_can_precede_final_ack_and_be_acknowledged() {
+        let mut s = socket_fast_open_with_response();
+        let sequence = s.local_seq_no;
+        acknowledge_fast_open(&mut s, 0, sequence + 9);
+        assert_eq!(s.state(), State::Established);
+        assert_eq!(s.send_queue(), 0);
+    }
+
+    #[test]
+    fn fast_open_retransmitted_syn_never_duplicates_payload() {
+        let mut s = socket_fast_open(64, 64);
+        let reply = send(&mut s, Instant::from_millis(1), &fast_open_syn()).unwrap();
+        assert_eq!(reply.control, TcpControl::Syn);
+        assert_eq!(reply.ack_number, Some(REMOTE_SEQ + 8));
+        let mut bytes = [0; 7];
+        assert_eq!(s.recv_slice(&mut bytes), Ok(7));
+        let reply = send(&mut s, Instant::from_millis(2), &fast_open_syn()).unwrap();
+        assert_eq!(reply.ack_number, Some(REMOTE_SEQ + 8));
+        assert_eq!(s.recv_queue(), 0);
+        assert!(s.may_recv());
+    }
+
+    #[test]
+    fn fast_open_disabled_and_cookie_request_use_ordinary_handshake() {
+        for disabled in [false, true] {
+            let mut s = socket();
+            s.listen(LOCAL_END).unwrap();
+            if !disabled {
+                s.prepare_fast_open(
+                    fast_open_syn().fast_open.unwrap(),
+                    FastOpenAdmission::Accept,
+                )
+                .unwrap();
+            }
+            let mut syn = fast_open_syn();
+            syn.fast_open = crate::wire::TcpFastOpenCookie::new(&[]);
+            send!(s, syn);
+            expect_fast_open_fallback(
+                &mut s,
+                if disabled {
+                    None
+                } else {
+                    fast_open_syn().fast_open
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn fast_open_syn_data_is_bounded_by_receive_capacity() {
+        let mut s = socket_fast_open(64, 4);
+        assert_eq!(s.recv_queue(), 4);
+        recv(&mut s, Instant::from_millis(0), |reply| {
+            assert_eq!(reply.unwrap().ack_number, Some(REMOTE_SEQ + 5));
+        });
+    }
+
+    #[test]
+    fn fast_open_close_defers_fin_until_syn_is_acknowledged() {
+        let mut s = socket_fast_open(64, 64);
+        let local_seq = s.local_seq_no;
+        s.close();
+        assert_eq!(s.state(), State::SynReceived);
+        assert!(!s.may_send());
+        expect_fast_open_syn_ack(&mut s, 0);
+        acknowledge_fast_open(&mut s, 0, local_seq + 1);
+        assert_eq!(s.state(), State::FinWait1);
+        recv(&mut s, Instant::from_millis(0), |reply| {
+            assert_eq!(reply.unwrap().control, TcpControl::Fin);
+        });
+    }
+
+    #[test]
+    fn fast_open_retry_exhaustion_reports_one_timeout() {
+        let mut s = socket_fast_open(64, 64);
+        s.set_fast_open_retries(NonZeroU8::new(1).unwrap());
+        for millis in [0, 1000] {
+            expect_fast_open_syn_ack(&mut s, millis);
+        }
+        recv(&mut s, Instant::from_millis(3000), |reply| {
+            assert_eq!(reply.unwrap().control, TcpControl::Rst);
+        });
+        assert_eq!(s.state(), State::Closed);
+        assert!(!s.fast_open_pending());
+        assert!(s.take_fast_open_timeout());
+        assert!(!s.take_fast_open_timeout());
+    }
+
+    #[test]
+    fn fast_open_ack_accepts_data_sent_before_synack_retransmission() {
+        let mut s = socket_fast_open_with_response();
+        let local_seq = s.local_seq_no;
+        expect_fast_open_syn_ack(&mut s, 1000);
+        recv_nothing(&mut s, Instant::from_millis(1001));
+        acknowledge_fast_open(&mut s, 1002, local_seq + 9);
+        assert_eq!(s.state(), State::Established);
+        assert_eq!(s.send_queue(), 0);
     }
 }

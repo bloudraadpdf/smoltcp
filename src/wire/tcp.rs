@@ -132,6 +132,7 @@ mod field {
     pub const OPT_SACKPERM: u8 = 0x04;
     pub const OPT_SACKRNG: u8 = 0x05;
     pub const OPT_TSTAMP: u8 = 0x08;
+    pub const OPT_FAST_OPEN: u8 = 34;
 }
 
 pub const HEADER_LEN: usize = field::URGENT.end;
@@ -626,6 +627,7 @@ pub enum TcpOption<'a> {
     SackPermitted,
     SackRange([Option<(u32, u32)>; 3]),
     TimeStamp { tsval: u32, tsecr: u32 },
+    FastOpen(FastOpenCookie),
     Unknown { kind: u8, data: &'a [u8] },
 }
 
@@ -694,6 +696,12 @@ impl<'a> TcpOption<'a> {
                         let tsecr = NetworkEndian::read_u32(&data[4..8]);
                         option = TcpOption::TimeStamp { tsval, tsecr };
                     }
+                    (field::OPT_FAST_OPEN, _) => {
+                        option = match FastOpenCookie::new(data) {
+                            Some(cookie) => TcpOption::FastOpen(cookie),
+                            None => TcpOption::Unknown { kind, data },
+                        };
+                    }
                     (_, _) => option = TcpOption::Unknown { kind, data },
                 }
             }
@@ -710,6 +718,7 @@ impl<'a> TcpOption<'a> {
             TcpOption::SackPermitted => 2,
             TcpOption::SackRange(s) => s.iter().filter(|s| s.is_some()).count() * 8 + 2,
             TcpOption::TimeStamp { tsval: _, tsecr: _ } => 10,
+            TcpOption::FastOpen(cookie) => 2 + cookie.as_bytes().len(),
             TcpOption::Unknown { data, .. } => 2 + data.len(),
         }
     }
@@ -761,6 +770,10 @@ impl<'a> TcpOption<'a> {
                         buffer[0] = field::OPT_TSTAMP;
                         NetworkEndian::write_u32(&mut buffer[2..], tsval);
                         NetworkEndian::write_u32(&mut buffer[6..], tsecr);
+                    }
+                    &TcpOption::FastOpen(cookie) => {
+                        buffer[0] = field::OPT_FAST_OPEN;
+                        buffer[2..length].copy_from_slice(cookie.as_bytes());
                     }
                     &TcpOption::Unknown {
                         kind,
@@ -820,7 +833,36 @@ pub struct Repr<'a> {
     pub sack_permitted: bool,
     pub sack_ranges: [Option<(u32, u32)>; 3],
     pub timestamp: Option<TcpTimestampRepr>,
+    pub fast_open: Option<FastOpenCookie>,
     pub payload: &'a [u8],
+}
+
+/// A bounded RFC 7413 cookie, or an empty cookie request.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct FastOpenCookie {
+    bytes: [u8; 16],
+    length: u8,
+}
+
+impl FastOpenCookie {
+    /// Copies a request or an even-sized cookie of four through sixteen bytes.
+    pub fn new(bytes: &[u8]) -> Option<Self> {
+        if !bytes.is_empty() && (!(4..=16).contains(&bytes.len()) || bytes.len() % 2 != 0) {
+            return None;
+        }
+        let mut cookie = Self {
+            bytes: [0; 16],
+            length: bytes.len() as u8,
+        };
+        cookie.bytes[..bytes.len()].copy_from_slice(bytes);
+        Some(cookie)
+    }
+
+    /// Returns the cookie bytes; an empty slice requests a cookie.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.length as usize]
+    }
 }
 
 pub type TcpTimestampGenerator = fn() -> u32;
@@ -896,6 +938,7 @@ impl<'a> Repr<'a> {
         let mut sack_permitted = false;
         let mut sack_ranges = [None, None, None];
         let mut timestamp = None;
+        let mut fast_open = None;
         while !options.is_empty() {
             let (next_options, option) = TcpOption::parse(options)?;
             match option {
@@ -925,6 +968,9 @@ impl<'a> Repr<'a> {
                 TcpOption::TimeStamp { tsval, tsecr } => {
                     timestamp = Some(TcpTimestampRepr::new(tsval, tsecr));
                 }
+                TcpOption::FastOpen(cookie) if control == Control::Syn => {
+                    fast_open = Some(cookie);
+                }
                 _ => (),
             }
             options = next_options;
@@ -942,6 +988,7 @@ impl<'a> Repr<'a> {
             sack_permitted: sack_permitted,
             sack_ranges: sack_ranges,
             timestamp: timestamp,
+            fast_open,
             payload: packet.payload(),
         })
     }
@@ -963,6 +1010,9 @@ impl<'a> Repr<'a> {
         }
         if self.timestamp.is_some() {
             length += 10;
+        }
+        if let Some(cookie) = self.fast_open {
+            length += 2 + cookie.as_bytes().len();
         }
         let sack_range_len: usize = self
             .sack_ranges
@@ -1032,6 +1082,9 @@ impl<'a> Repr<'a> {
                     tsecr: timestamp.tsecr,
                 }
                 .emit(tmp);
+            }
+            if let Some(cookie) = self.fast_open {
+                options = TcpOption::FastOpen(cookie).emit(options);
             }
 
             if !options.is_empty() {
@@ -1116,6 +1169,7 @@ impl<'a, T: AsRef<[u8]> + ?Sized> fmt::Display for Packet<&'a T> {
                 TcpOption::TimeStamp { tsval, tsecr } => {
                     write!(f, " tsval {tsval:08x} tsecr {tsecr:08x}")?
                 }
+                TcpOption::FastOpen(cookie) => write!(f, " fast-open={:02x?}", cookie.as_bytes())?,
                 TcpOption::Unknown { kind, .. } => write!(f, " opt({kind})")?,
             }
             options = next_options;
@@ -1281,6 +1335,7 @@ mod test {
     #[cfg(feature = "proto-ipv4")]
     fn packet_repr() -> Repr<'static> {
         Repr {
+            fast_open: None,
             src_port: 48896,
             dst_port: 80,
             seq_number: SeqNumber(0x01234567),
@@ -1400,5 +1455,70 @@ mod test {
         assert_eq!(TcpOption::parse(&[0xc, 0x01]), Err(Error));
         assert_eq!(TcpOption::parse(&[0x2, 0x02]), Err(Error));
         assert_eq!(TcpOption::parse(&[0x3, 0x02]), Err(Error));
+    }
+    #[test]
+    fn fast_open_cookie_lengths_and_option_encoding() {
+        for length in 0..=20 {
+            let bytes = [0x5a; 20];
+            let expected = length == 0 || ((4..=16).contains(&length) && length % 2 == 0);
+            assert_eq!(FastOpenCookie::new(&bytes[..length]).is_some(), expected);
+            let Some(cookie) = FastOpenCookie::new(&bytes[..length]) else {
+                continue;
+            };
+            let option = TcpOption::FastOpen(cookie);
+            let mut encoded = [0; 18];
+            let length = option.buffer_len();
+            assert_eq!(option.emit(&mut encoded[..length]).len(), 0);
+            assert_eq!(encoded[0], 34);
+            assert_eq!(TcpOption::parse(&encoded[..length]), Ok((&[][..], option)));
+        }
+        for length in [3, 4, 5, 7, 19, 20] {
+            let mut bytes = [0; 20];
+            bytes[0] = 34;
+            bytes[1] = length;
+            assert!(matches!(
+                TcpOption::parse(&bytes[..length as usize]),
+                Ok((_, TcpOption::Unknown { kind: 34, .. }))
+            ));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv4")]
+    fn fast_open_wire_round_trip_and_non_syn_ignore() {
+        let mut repr = packet_repr();
+        repr.fast_open = FastOpenCookie::new(&[0x42; 8]);
+        let mut bytes = vec![0; repr.buffer_len()];
+        let capabilities = ChecksumCapabilities::default();
+        repr.emit(
+            &mut Packet::new_unchecked(&mut bytes),
+            &SRC_ADDR.into(),
+            &DST_ADDR.into(),
+            &capabilities,
+        );
+        let parsed = Repr::parse(
+            &Packet::new_unchecked(&bytes),
+            &SRC_ADDR.into(),
+            &DST_ADDR.into(),
+            &capabilities,
+        )
+        .unwrap();
+        assert_eq!(parsed.fast_open, repr.fast_open);
+        assert_eq!(parsed.payload, repr.payload);
+        repr.control = Control::None;
+        repr.emit(
+            &mut Packet::new_unchecked(&mut bytes),
+            &SRC_ADDR.into(),
+            &DST_ADDR.into(),
+            &capabilities,
+        );
+        let parsed = Repr::parse(
+            &Packet::new_unchecked(&bytes),
+            &SRC_ADDR.into(),
+            &DST_ADDR.into(),
+            &capabilities,
+        )
+        .unwrap();
+        assert_eq!(parsed.fast_open, None);
     }
 }

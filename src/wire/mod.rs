@@ -99,6 +99,7 @@ pub mod ip;
 #[cfg(feature = "proto-ipv4")]
 pub mod ipv4;
 #[cfg(feature = "proto-ipv6")]
+/// IPv6 address extensions and packet representations.
 pub mod ipv6;
 #[cfg(feature = "proto-ipv6")]
 mod ipv6ext_header;
@@ -273,8 +274,9 @@ pub use self::mld::{
 pub use self::udp::{Packet as UdpPacket, Repr as UdpRepr, HEADER_LEN as UDP_HEADER_LEN};
 
 pub use self::tcp::{
-    Control as TcpControl, Packet as TcpPacket, Repr as TcpRepr, SeqNumber as TcpSeqNumber,
-    TcpOption, TcpTimestampGenerator, TcpTimestampRepr, HEADER_LEN as TCP_HEADER_LEN,
+    Control as TcpControl, FastOpenCookie as TcpFastOpenCookie, Packet as TcpPacket,
+    Repr as TcpRepr, SeqNumber as TcpSeqNumber, TcpOption, TcpTimestampGenerator, TcpTimestampRepr,
+    HEADER_LEN as TCP_HEADER_LEN,
 };
 
 #[cfg(feature = "proto-dhcpv4")]

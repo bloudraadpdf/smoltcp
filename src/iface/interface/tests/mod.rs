@@ -161,6 +161,7 @@ fn test_handle_udp_broadcast(#[case] medium: Medium) {
 pub fn tcp_not_accepted() {
     let (mut iface, mut sockets, _) = setup(Medium::Ip);
     let tcp = TcpRepr {
+        fast_open: None,
         src_port: 4242,
         dst_port: 4243,
         control: TcpControl::Syn,
@@ -205,6 +206,7 @@ pub fn tcp_not_accepted() {
                 hop_limit: 64,
             },
             IpPayload::Tcp(TcpRepr {
+                fast_open: None,
                 src_port: 4243,
                 dst_port: 4242,
                 control: TcpControl::Rst,

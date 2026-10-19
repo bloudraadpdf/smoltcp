@@ -327,7 +327,11 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
             let slice = self.get_unallocated(offset, data.len());
             let slice_len = slice.len();
             data.index(0..slice_len).copy_to_slice(slice);
-            (slice_len, offset + slice_len, data.index(slice_len..data.len()))
+            (
+                slice_len,
+                offset + slice_len,
+                data.index(slice_len..data.len()),
+            )
         };
         let size_2 = {
             let slice = self.get_unallocated(offset, data.len());
@@ -719,13 +723,13 @@ mod test {
         ring.enqueue_many(6).copy_from_slice(b"abcdef");
         ring.dequeue_many(6).copy_from_slice(b"ABCDEF");
 
-        assert_eq!(ring.write_unallocated(0, b"ghi"), 3);
+        assert_eq!(ring.write_unallocated(0, &b"ghi"[..]), 3);
         assert_eq!(ring.get_unallocated(0, 3), b"ghi");
 
-        assert_eq!(ring.write_unallocated(3, b"jklmno"), 6);
+        assert_eq!(ring.write_unallocated(3, &b"jklmno"[..]), 6);
         assert_eq!(ring.get_unallocated(3, 3), b"jkl");
 
-        assert_eq!(ring.write_unallocated(9, b"pqrstu"), 3);
+        assert_eq!(ring.write_unallocated(9, &b"pqrstu"[..]), 3);
         assert_eq!(ring.get_unallocated(9, 3), b"pqr");
     }
 
